@@ -5,6 +5,10 @@ from functools import partial
 from collections import namedtuple
 from multiprocessing import cpu_count
 
+import wandb
+# Initialize a new run
+run = wandb.init(project="DDPM_testing", entity="kirilm")
+
 import torch
 from torch import nn, einsum, Tensor
 import torch.nn.functional as F
@@ -428,7 +432,7 @@ class Unet1D(nn.Module):
         x = self.init_conv(x)
         r = x.clone()
 
-        t =None#self.time_mlp(time)
+        t = None#self.time_mlp(time)
 
         h = []
 
@@ -501,12 +505,17 @@ class GaussianDiffusion1D(nn.Module):
     ):
         super().__init__()
         self.model = model
+        wandb.watch(self.model, log_freq=10)
         self.channels = self.model.channels
         self.self_condition = self.model.self_condition
 
         self.seq_length = seq_length
 
         self.objective = objective
+
+        # added noises_list for easy sharing
+        self.noises_list = []
+        self.noises_list2 = []
 
         assert objective in {'pred_noise', 'pred_x0', 'pred_v'}, 'objective must be either pred_noise (predict noise) or pred_x0 (predict image start) or pred_v (predict v [v-parameterization as defined in appendix D of progressive distillation paper, used in imagen-video successfully])'
 
@@ -662,18 +671,22 @@ class GaussianDiffusion1D(nn.Module):
         batch, device = shape[0], self.betas.device
 
         img = torch.randn(shape, device=device)
-
+        self.noises_list2.append(img)
         x_start = None
 
         for t in tqdm(reversed(range(0, self.num_timesteps)), desc = 'sampling loop time step', total = self.num_timesteps):
             self_cond = x_start if self.self_condition else None
             img, x_start = self.p_sample(img, t, self_cond)
+            self.noises_list2.append(img)
 
         img = self.unnormalize(img)
         return img
 
     @torch.no_grad()
     def ddim_sample(self, shape, clip_denoised = True):
+        
+        # DEBUG
+        print('ddim_sample')
         batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[0], self.betas.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
 
         times = torch.linspace(-1, total_timesteps - 1, steps=sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
@@ -681,6 +694,9 @@ class GaussianDiffusion1D(nn.Module):
         time_pairs = list(zip(times[:-1], times[1:])) # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
 
         img = torch.randn(shape, device = device)
+        
+        # append 
+        self.noised_array.append(img)
 
         x_start = None
 
@@ -699,7 +715,53 @@ class GaussianDiffusion1D(nn.Module):
             sigma = eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
             c = (1 - alpha_next - sigma ** 2).sqrt()
 
+            
             noise = torch.randn_like(img)
+            
+            # append this noise ? 
+            self.noised_array.append(noise)
+
+            img = x_start * alpha_next.sqrt() + \
+                  sigma * noise
+
+        img = self.unnormalize(img)
+        return img
+
+
+    # new method for comparison
+    @torch.no_grad()
+    def ddim_sample_deterministic(self, noises_array, shape, clip_denoised = True):
+        
+        # DEBUG
+        print('ddim_deterministic')    
+        i = 0
+        batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[0], self.betas.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
+
+        times = torch.linspace(-1, total_timesteps - 1, steps=sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
+        times = list(reversed(times.int().tolist()))
+        time_pairs = list(zip(times[:-1], times[1:])) # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
+
+        img = noises_array[i]
+
+        x_start = None
+
+        for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):
+            i+=1
+            time_cond = torch.full((batch,), time, device=device, dtype=torch.long)
+            self_cond = x_start if self.self_condition else None
+            pred_noise, x_start, *_ = self.model_predictions(img, time_cond, self_cond, clip_x_start = clip_denoised)
+
+            if time_next < 0:
+                img = x_start
+                continue
+
+            alpha = self.alphas_cumprod[time]
+            alpha_next = self.alphas_cumprod[time_next]
+
+            sigma = eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
+            c = (1 - alpha_next - sigma ** 2).sqrt()
+
+            noise = noises_array[i]
 
             img = x_start * alpha_next.sqrt() + \
                   c * pred_noise + \
@@ -710,7 +772,7 @@ class GaussianDiffusion1D(nn.Module):
 
     @torch.no_grad()
     def sample(self, batch_size = 16):
-        seq_length, channels = self.seq_length, self.channels
+        seq_length, channels = self.seq_length, self.channels   
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
         return sample_fn((batch_size, channels, seq_length))
 
@@ -800,7 +862,7 @@ class Trainer1D(object):
         train_batch_size = 16,
         gradient_accumulate_every = 1,
         train_lr = 1e-4,
-        train_num_steps = 100000,
+        train_num_steps = 100_000,
         ema_update_every = 10,
         ema_decay = 0.995,
         adam_betas = (0.9, 0.99),
@@ -808,7 +870,7 @@ class Trainer1D(object):
         num_samples = 25,
         results_folder = './results',
         amp = False,
-        mixed_precision_type = False, #'fp16',
+        mixed_precision_type = 'fp16',#False, 
         split_batches = True,
     ):
         super().__init__()
@@ -817,7 +879,7 @@ class Trainer1D(object):
 
         self.accelerator = Accelerator(
             split_batches = split_batches,
-            mixed_precision = 'no'# mixed_precision_type if amp else 'no'
+            mixed_precision = mixed_precision_type if amp else 'no' #'no'# 
         ) 
 
         # model
@@ -925,6 +987,9 @@ class Trainer1D(object):
 
                 accelerator.clip_grad_norm_(self.model.parameters(), 1.0)
                 pbar.set_description(f'loss: {total_loss:.4f}')
+                
+                # Log the total_loss to wandb
+                wandb.log({"total_loss": total_loss}, step=self.step)
 
                 accelerator.wait_for_everyone()
 
